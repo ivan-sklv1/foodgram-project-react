@@ -3,7 +3,7 @@ import base64
 
 from django.core.files.base import ContentFile
 from djoser.serializers import UserCreateSerializer, UserSerializer
-from rest_framework import serializers, status
+from rest_framework import serializers
 
 from recipes.models import (
     Ingredient, Recipe, Tag, RecipeIngredient,
@@ -197,32 +197,37 @@ class RecipeCreateUpdateSerializer(serializers.ModelSerializer):
         )
         return serializer.data
 
-    def validate_ingredients(self, obj):
-        """Метод валидации ингредиентов"""
+    def validate(self, data):
+        tags = data.get('tags')
+        if not tags:
+            raise serializers.ValidationError({'tags': 'Обязательное поле.'})
+        if len(tags) != len(set(tags)):
+            raise serializers.ValidationError(
+                {'tags': 'Теги должны быть уникальными!'}
+            )
 
         ingredients = self.initial_data.get('ingredients')
         if not ingredients:
             raise serializers.ValidationError(
-                detail='Должен быть минимум один ингредиент!',
-                code=status.HTTP_400_BAD_REQUEST,
+                {'ingredients': 'Обязательное поле.'}
             )
-        
-        return obj
 
-    def validate_tags(self, obj):
-        """Метод валидации тегов"""
-
-        if len(obj['tags']) < 1:
-            raise serializers.ValidationError(
-                detail='Должен быть минимум один тег!',
-                code=status.HTTP_400_BAD_REQUEST,
-            )
-        return obj
+        ingredient_list = []
+        for ingredient in ingredients:
+            if ingredient in ingredient_list:
+                raise serializers.ValidationError('Ингредиент повторяется.')
+            ingredient_list.append(ingredient)
+        return data
 
     def create_ingredients(self, ingredients, recipe):
         for element in ingredients:
             id = element['id']
-            ingredient = Ingredient.objects.get(pk=id)
+            try:
+                ingredient = Ingredient.objects.get(pk=id)
+            except Ingredient.DoesNotExist:
+                raise serializers.ValidationError(
+                    {'ingredients': 'Ингредиент не найден!'}
+                )
             amount = element['amount']
             RecipeIngredient.objects.create(
                 ingredient=ingredient, recipe=recipe, amount=amount
@@ -232,16 +237,11 @@ class RecipeCreateUpdateSerializer(serializers.ModelSerializer):
         recipe.tags.set(tags)
 
     def create(self, validated_data):
-        ingredients = validated_data.pop('ingredients')
+        ingredients_data = validated_data.pop('ingredients')
         tags = validated_data.pop('tags')
         recipe = Recipe.objects.create(**validated_data)
-        self.create_ingredients(ingredients, recipe)
+        self.create_ingredients(ingredients_data, recipe)
         self.create_tags(tags, recipe)
-        if ingredients is None:
-            raise serializers.ValidationError(
-                detail='Должен быть минимум один ингредиент!',
-                code=status.HTTP_400_BAD_REQUEST,
-            )
         return recipe
 
     def update(self, instance, validated_data):
@@ -269,7 +269,54 @@ class AdditionalRecipeSerializer(serializers.ModelSerializer):
 
 class SubscribeSerializer(CustomUserSerializer):
     """Сериализатор для модели Subscribe"""
+    email = serializers.ReadOnlyField(source='author.email')
+    id = serializers.ReadOnlyField(source='author.id')
+    username = serializers.ReadOnlyField(source='author.username')
+    first_name = serializers.ReadOnlyField(source='author.first_name')
+    last_name = serializers.ReadOnlyField(source='author.last_name')
+    recipes = serializers.SerializerMethodField(
+        read_only=True,
+        method_name='get_recipes'
+    )
+    recipes_count = serializers.ReadOnlyField(source='author.recipes.count')
+    is_subscribed = serializers.SerializerMethodField()
 
+    class Meta:
+        model = Subscribe
+        fields = (
+            'email',
+            'id',
+            'username',
+            'first_name',
+            'last_name',
+            'is_subscribed',
+            'recipes',
+            'recipes_count',
+        )
+
+    def get_recipes(self, obj):
+        """Метод для получения рецептов"""
+
+        recipes = obj.author.recipes.all()
+        recipes_limit = self.context.get('request').GET.get('recipes_limit')
+        if recipes_limit:
+            recipes = recipes[:int(recipes_limit)]
+        return AdditionalRecipeSerializer(recipes, many=True).data
+
+    def get_is_subscribed(self, obj):
+        """Метод для получения подписки"""
+        request = self.context.get('request')
+        if request is None or request.user.is_anonymous:
+            return False
+        return Subscribe.objects.filter(
+            user=request.user,
+            author=obj.author
+        ).exists()
+
+
+class SubscriptionSerializer(serializers.ModelSerializer):
+    """Сериализатор для модели Subscribe"""
+    is_subscribed = serializers.SerializerMethodField()
     recipes = serializers.SerializerMethodField(
         read_only=True,
         method_name='get_recipes'
@@ -277,6 +324,7 @@ class SubscribeSerializer(CustomUserSerializer):
     recipes_count = serializers.SerializerMethodField(
         read_only=True
     )
+    email = serializers.ReadOnlyField()
 
     class Meta:
         model = User
@@ -307,6 +355,12 @@ class SubscribeSerializer(CustomUserSerializer):
 
         return obj.recipes.count()
 
+    def get_is_subscribed(self, obj):
+        request = self.context.get('request')
+        if not request:
+            return False
+        return Subscribe.objects.filter(user=request.user, author=obj).exists()
+
 
 class FavoriteRecipeSerializer(serializers.ModelSerializer):
     """Сериализатор для добавления в избранное."""
@@ -314,4 +368,9 @@ class FavoriteRecipeSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Recipe
-        fields = ('id', 'name', 'image', 'cooking_time')
+        fields = (
+            'id',
+            'name',
+            'image',
+            'cooking_time'
+        )
